@@ -3,8 +3,6 @@
 ;; Mapping out systems
 ;; Interactive tables
 
-;;{"token":"c9b966de-5588-4375-86b9-1d4d24b46adb","user":{"id":"ckmaqc05d11880721cs6oklgyfe0","username":"GazNougat","picture":null,"email":null,"credits":0,"createdAt":"2021-03-15T15:16:25.154Z","updatedAt":"2021-03-15T15:16:25.154Z"}}
-
 (require 'request)
 (require 'cl) ;; lexical-let is not automatically available?
 (setq debug-on-error t)
