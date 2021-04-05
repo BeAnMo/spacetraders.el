@@ -6,7 +6,7 @@
 (require 'request)
 (require 'deferred)
 (require 'request-deferred)
-(require 'cl) ;; lexical-let is not automatically available?
+(require 'cl-lib) ;; lexical-let is not automatically available?
 (setq debug-on-error t)
 
 (defgroup spacetraders nil
@@ -265,6 +265,12 @@ eg: '(a b c) -> '((1 . a) (2 . b) (3 . c))"
    (when (eq (car action) 'fetch/user)
      (st-fetch-user))))
 
+(st-state-add-listener
+ 'view-user
+ (lambda (action)
+   (when (eq (car action) 'retrieved/user)
+     (st-view-user))))
+
 (defun st-action-retrieved/user (data)
   (cons 'retrieved/user data))
 
@@ -507,7 +513,9 @@ GOOD: string"
      :callback (cl-function
 		(lambda (&key data &key error-thrown &allow-other-keys)
 		  (if error-thrown
-		      (message "ST-ERR:[%s] &s" endpoint error-thrown)
+		      (progn
+			(message "ST-ERR:[post/ship-purchase] %s" error-thrown)
+			(pp data))
 		    (progn
 		      (message "[Purchased ship]")
 		      (pp data)
@@ -533,7 +541,9 @@ GOOD: string"
 		   (pp data))
 	       (funcall st-state-dispatch
 			(st-action-retrieved/system data))))))
-       (st-deferred-fetch-marketplace (st-get-ship-location))
+       (deferred:nextc it
+	 (lambda ()
+	   (st-deferred-fetch-marketplace (st-get-ship-location))))
        (deferred:nextc it
 	 (lambda (res)
 	   (let ((data (request-response-data res))
@@ -654,23 +664,9 @@ P2: (cons number numer)"
 ;; Flightplans ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defun st-saga-completed/flightplan ()
   (deferred:$
-    ;; This has to be in inverse order because?
-    (deferred:next (lambda () (st-deferred-fetch-marketplace (st-get-ship-location))))
+    (st-deferred-fetch-user)
     (deferred:nextc it
       (lambda (res)
-	(message "[marketplace response handler]")
-	(let ((data (request-response-data res))
-	      (err (request-response-error-thrown res)))
-	  (if (request-response-error-thrown res)
-	      (progn
-		(message "ST:ERR[retrieved/marketplace] %s" err)
-		(pp data))
-	    (funcall st-state-dispatch
-		     (st-action-retrieved/marketplace data))))))
-    (deferred:call 'st-deferred-fetch-user)
-    (deferred:nextc it
-      (lambda (res)
-	(message "[user response handler]")
 	(let ((data (request-response-data res))
 	      (err (request-response-error-thrown res)))
 	  (if (request-response-error-thrown res)
@@ -679,6 +675,20 @@ P2: (cons number numer)"
 		(pp data))
 	    (funcall st-state-dispatch
 		     (st-action-retrieved/user data))))))
+    ;; Need to use deferred:nextc to ensure order.
+    (deferred:nextc it
+      (lambda ()
+	(st-deferred-fetch-marketplace (st-get-ship-location))))
+    (deferred:nextc it
+      (lambda (res)
+	(let ((data (request-response-data res))
+	      (err (request-response-error-thrown res)))
+	  (if (request-response-error-thrown res)
+	      (progn
+		(message "ST:ERR[retrieved/marketplace] %s" err)
+		(pp data))
+	    (funcall st-state-dispatch
+		     (st-action-retrieved/marketplace data)))))) 
     (deferred:error it
       (lambda (err)
 	(message "ST:ERR[saga-completed/flightplan] %s" err)))))
@@ -768,6 +778,19 @@ P2: (cons number numer)"
 		  (progn
 		    (message "ST:[fetch/flightplan] Retrieved flightplan.")
 		    (pp d)))))))
+
+(defun st-post-warp-jump (ship-id)
+  (interactive
+   (if (string= (st-get-ship-location) "OE-XV-91-2")
+       (list st-current-ship)
+     (let ((ship-id (st-read-options (st-options-user-ships))))
+       (list ship-id))))
+  (st-api-call (format "users/%s/warp-jump" spacetraders-username)
+	       :method "post"
+	       :headers `((Content-Type . application/json))
+	       :params `((token . ,spacetraders-token))
+	       :data (json-encode `((shipId . ,ship-id)))
+	       :callback 'st-dispatch-flightplan))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Marketplace functions ;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1002,65 +1025,6 @@ SELECTORS: Assoc-List -> Assoc-List"
     (cons (select-headers projected)
 	  (select-rows projected))))
 
-(defun expr-replace (expr placeholder value)
-  "Replaces a symbol in an arbitrarily nested sexpr with the given value.
-
-EXPR: List
-PLACEHOLDER: symbol
-VALUE: any"
-  (defun atomp (expr)
-    (or (numberp expr)
-	(symbolp expr)
-	(stringp expr)))
-  
-  (defun pairp (exp)
-    (and (listp expr) (atomp (cdr expr))))
-  
-  (defun swap-atom (exp)
-    (if (eq exp placeholder)
-	value
-      exp))
-  
-  (defun traverse (exp)
-    (cond
-     ((null exp) nil)
-     ((pairp exp) (cons (decide (car exp)) (decide (cdr exp))))
-     ((cons (decide (car exp)) (traverse (cdr exp))))))
-  
-  (defun decide (exp)
-    (if (atomp exp)
-	(swap-atom exp)
-      (traverse exp)))
-  
-  (decide expr))
-
-(defun replace-holders (originals replacements)
-  (cond
-   ((null originals) nil)
-   ((and (symbolp (car originals))
-	     (string= (substring (symbol-name (car originals)) 0 1)
-		      "$")) 
-    (cons (car replacements)
-	  (replace-holders (cdr originals)
-			   (cdr replacements))))
-   (:else (cons (car originals)
-		(replace-holders (cdr originals)
-				 replacements)))))
-  
-(defmacro $> (form)
-  "Binds a lambda to FORM, allowing use of the placeholder symbol '$'.
-
-FORM: List
-
-ex: ($> (+ 1 $0 3 $1)) expands to (lambda (x y) (+ 1 x 3 y))
-
-"
-  (lexical-let ((fn (car form))
-		(args0 (cdr form)))
-    (cond
-     ((null args0) (lambda (&rest args1) (apply fn args1)))
-     (:else (lambda (&rest args1)
-	      (apply fn (replace-holders args0 args1)))))))
 
 (defun write-table-to-buffer (name table &optional use-org-mode)
   "Creates a text table in a new buffer called NAME.
@@ -1161,6 +1125,8 @@ A-LIST: List-of-Assoc"
 	;; Need to keep track of posn in buffer
 	;; in order to insert components properly.
 	(funcall component)
+	;; This allows org-buffer tables to format properly.
+	;; Why?
 	(forward-line 100)
 	(insert "\n")))))
 
@@ -1187,7 +1153,7 @@ A-LIST: List-of-Assoc"
 			  (st-get-user-loan-status)))
 	(local-cargo
 	 (apply-partially 'st-display-table
-			  "* Current Ship Cargo"
+			  (format "* Cargo for %s" st-current-ship)
 			  (st-status-ship-cargo))))
     (st-write-into-buffer
      (format "*ST-User: %s*" spacetraders-username)
