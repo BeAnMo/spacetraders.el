@@ -3,6 +3,8 @@ Emacs Lisp client for the SpaceTraders API
 
 Bless this mess
 
+![image](https://user-images.githubusercontent.com/19170025/113608380-220f4000-9610-11eb-9d38-3e1853d8aae0.png)
+
 ### Requirements
 - Emacs >= 27.1 (unsure about older versions)
 - request.el
