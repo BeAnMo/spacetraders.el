@@ -6,7 +6,7 @@
 (require 'request)
 (require 'deferred)
 (require 'request-deferred)
-(require 'cl-lib) ;; lexical-let is not automatically available?
+(require 'cl) ;; lexical-let is not automatically available?
 (setq debug-on-error t)
 
 (defgroup spacetraders nil
