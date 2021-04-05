@@ -9,7 +9,7 @@ Read/write to local state:
 - `st-get`
 - `st-set` (can trigger other actions).
 
-Display certain into in the minibuffer:
+Display certain data in the minibuffer:
 - `st-query`
 
 
