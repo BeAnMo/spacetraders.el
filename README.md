@@ -3,6 +3,12 @@ Emacs Lisp client for the SpaceTraders API
 
 Bless this mess
 
+### Requirements
+- Emacs >= 27.1 (unsure about older versions)
+- request.el
+- deferred.el
+- request-deferred.el
+
 ### Commands
 `M-x`
 Read/write to local state:
