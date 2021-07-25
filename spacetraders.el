@@ -1,7 +1,10 @@
-;; Notes
-;; Need tables - loans/ships/cargo
-;; Mapping out systems
-;; Interactive tables
+;; TODOS
+;; - accept "?" for commands to bring up all options
+;;   (for each st-get/set/put/etc...)
+;; - automate workflows with actions
+;; - interactive tables
+;;   (click on PK/FK in tables to bring up other displays)
+;; - 
 
 (require 'request)
 (require 'deferred)
@@ -26,9 +29,87 @@
 (defvar-local spacetraders-user-created-at ""
   "When the current user/token was generated. Data is wiped after 1 week on Sunday.")
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Spacetraders Requests  ;;;;;;;;;;;;;;;;;;;;;;;;
+(defvar st-api-current-error nil
+  "Current API response error.")
+(defvar st-api-current-response nil
+  "Current API response.")
+(defvar st-api-current-urlq "NONE"
+  "Current API response URL.")
+
+(defun st-api-url (pathname)
+  (format "https://api.spacetraders.io/%s"
+	  pathname))
+
+(defmacro st-with-current-api-response (&rest body)
+  "Calls operations in BODY with the current api response. Errors are logged. Binds any error to ST-API-CURRENT-ERROR and the response to ST-API-CURRENT-RESPONSE.
+
+BODY: (...Sexpr)"
+  `(cl-function
+    (lambda (&key response &key data &key error-thrown &allow-other-keys)
+      (let ((st-api-current-error error-thrown)
+	    (st-api-current-response data))
+	(if error-thrown
+	    (st-log-api-current-error)
+	  (progn ,@body))))))
+
+(defun st-log-api-current-error ()
+  "Log the current API error state to the minibuffer."
+  (progn
+    (message "ST:ERR[%s] %s"
+	     st-api-current-url
+	     st-api-current-error)
+    (pp st-api-current-response)))
+
+(defun st-api-call (endpoint &rest args)
+  (let ((method (get-or args :method "GET"))
+	(headers (get-or args :headers nil))
+	(params (get-or args :params nil))
+	(data (get-or args :data nil))
+	(callback (get-or args :callback nil)))
+    ;; How to get st-api-current-url in the callback?
+    ;; This setq sucks.
+    (setq st-api-current-url endpoint)
+    (request (st-api-url endpoint)
+	     :type method
+	     :parser 'json-read
+	     :params params
+	     :data data
+	     :headers headers
+	     :complete callback)))
+
+(defun st-deferred-api-call (endpoint &rest args)
+  (let ((method (get-or args :method "GET"))
+	(headers (get-or args :headers nil))
+	(params (get-or args :params nil))
+	(data (get-or args :data nil)))
+    (setq st-api-current-url endpoint)
+    (request-deferred (st-api-url endpoint)
+		      :type method
+		      :parser 'json-read
+		      :params params
+		      :data data
+		      :headers headers)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Request token ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Auth ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defun st-fetch-claim-user (username)
+  (interactive
+   (let ((username (read-string "Claim username: ")))
+     (list username)))
+  (st-api-call
+   (format "users/%s/claim" username)
+   :method "post"
+   :callback (st-with-current-api-response
+	      (setq spacetraders-token
+		    (assoc-default 'token st-api-current-response))
+	      (setq spacetraders-username
+		    (assoc-default 'username st-api-current-response))
+	      (message "ST:[%s] %s"
+		       st-api-current-url
+		       st-api-current-response))))
+
 (defun st-fetch-token (username)
   (interactive
    (let ((username (if (string= "" spacetraders-username)
@@ -38,19 +119,28 @@
   (st-api-call
    (format "users/%s/token" username)
    :method "post"
-   :callback (cl-function
-	      (lambda (&key data &key error-thrown &allow-other-keys)
-		(progn
-		  (message "ST:[fetch/token]")
-		  (pp data)
-		  (setq spacetraders-token
-			(assoc-default 'token data))
-		  (let ((user (assoc-default 'user data)))
-		    (setq spacetraders-user-created-at
-			  (assoc-default 'createdAt user))
-		    (setq spacetraders-username
-			  (assoc-default 'username user))))))))
-			  
+   :callback (st-with-current-api-response
+	      (message "ST:[fetch/token")
+	      (pp data)
+	      (setq spacetraders-token
+		    (assoc-default 'token st-api-current-response))
+	      (let ((user (assoc-default 'user st-api-current-response)))
+		(setq spacetraders-user-created-at
+		      (assoc-default 'createdAt user))
+		(setq spacetraders-username
+		      (assoc-default 'username user))))))
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Game Status ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defun st-fetch-game-status ()
+  (interactive)
+  (st-api-call
+   "game/status"
+   :callback (st-with-current-api-response
+	      (message "ST:[%s] %s"
+		       st-api-current-url
+		       st-api-current-response))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Current states ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -108,22 +198,22 @@ NAME: symbol"
     (dolist (pair st-state-subscriptions)
       (funcall (cdr pair) action))))
 
-(defun st-action-apply-middleware (dispatch middleware)
+(defun st-middleware-compose (dispatch middleware)
   "Returns the enhanced version of dispatch.
 
 DISPATCH: Action => nil
 MIDDLEWARE: (list DISPATCH => Action => nil)"
-  (if (null middleware)
-      dispatch
-    (st-action-apply-middleware
-     (funcall (car middleware) dispatch)
-     (cdr middleware))))
+  (let ((composed dispatch))
+    (dolist (proc middleware composed)
+      (setq composed (funcall proc composed)))
+    composed))
 
 (defun st-middleware-logger (dispatch)
   (lexical-let ((next dispatch))
     (lambda (action)
       (progn
 	(message "ST:action[%s]" (car action))
+	(pp (cdr action))
 	(funcall next action)))))
 
 (defun st-middleware-thunk (dispatch)
@@ -146,10 +236,10 @@ MIDDLEWARE: (list DISPATCH => Action => nil)"
 	(funcall next action)))))
 
 (defvar st-state-dispatch
-  (st-action-apply-middleware 'st-action-dispatch
-			      (list 'st-middleware-logger
-				    'st-middleware-transaction-logger
-				    'st-middleware-thunk))
+  (st-middleware-compose 'st-action-dispatch
+			 (list 'st-middleware-logger
+			       'st-middleware-transaction-logger
+			       'st-middleware-thunk))
   "Enhanced global action dispatch.")
 
 ;; FLOW
@@ -183,35 +273,6 @@ ACTION: (cons symbol any)"
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Spacetraders helper functions ;;;;;;;;;;;;;;;;;
-(defun st-api-url (pathname)
-  (format "https://api.spacetraders.io/%s"
-	  pathname))
-
-(defun st-api-call (endpoint &rest args)
-  (let ((method (get-or args :method "GET"))
-	(headers (get-or args :headers nil))
-	(params (get-or args :params nil))
-	(data (get-or args :data nil))
-	(callback (get-or args :callback nil)))
-    (request (st-api-url endpoint)
-	     :type method
-	     :parser 'json-read
-	     :params params
-	     :data data
-	     :headers headers
-	     :complete callback)))
-
-(defun st-deferred-api-call (endpoint &rest args)
-  (let ((method (get-or args :method "GET"))
-	(headers (get-or args :headers nil))
-	(params (get-or args :params nil))
-	(data (get-or args :data nil)))
-    (request-deferred (st-api-url endpoint)
-		      :type method
-		      :parser 'json-read
-		      :params params
-		      :data data
-		      :headers headers)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Commands ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -271,9 +332,6 @@ eg: '(a b c) -> '((1 . a) (2 . b) (3 . c))"
    (when (eq (car action) 'retrieved/user)
      (st-view-user))))
 
-(defun st-action-retrieved/user (data)
-  (cons 'retrieved/user data))
-
 (defun st-get-user ()
   (assoc-default 'user st-user))
 
@@ -310,13 +368,9 @@ eg: '(a b c) -> '((1 . a) (2 . b) (3 . c))"
    (seq-map (apply-partially 'assoc-default 'id)
 	    (st-get-user-ships))))
 
-(cl-defun st-dispatch-fetch-user (&key data &key error-thrown &allow-other-keys)
-  (if (not (null error-thrown))
-      (progn
-	(message "ST:ERR[fetch/user] %s" error-thrown)
-	(pp data))
-    (funcall st-state-dispatch
-	     (st-action-retrieved/user data))))
+(defun st-dispatch-fetch-user (data)
+  (funcall st-state-dispatch
+	   (cons 'retrieved/user data)))
   
 (defun st-fetch-user ()
   "Fetch & set the current user state."
@@ -325,7 +379,8 @@ eg: '(a b c) -> '((1 . a) (2 . b) (3 . c))"
    (format "users/%s" spacetraders-username)
    :headers '((Content-Type . "application/json"))
    :params `((token . ,spacetraders-token))
-   :callback 'st-dispatch-fetch-user))
+   :callback (st-with-current-api-response
+	      (st-dispatch-fetch-user st-api-current-response))))
 
 (defun st-deferred-fetch-user ()
   (st-deferred-api-call
@@ -373,8 +428,10 @@ GOOD: string"
 
 (defun st-get-ship-system ()
   (let ((val (st-get-ship-location)))
-    (if (null val) "" (substring val 0 2))))
-
+    (if (null val)
+	""
+      (car (split-string val "\-")))))
+ 
 (defun st-get-ship-coords ()
   (let ((s (st-get-ship)))
     (cons (assoc-default 'x s)
@@ -415,15 +472,8 @@ GOOD: string"
    :headers `((Content-Type . "application/json"))
    :data (json-encode `((good . ,good)
 			(quantity . ,quantity)))
-   :callback (cl-function
-	      (lambda (&key data &key error-thrown &allow-other-keys)
-		(if error-thrown
-		    (message "ST-ERR:[%s] &s" endpoint error-thrown)
-		  (progn
-		    (message "ST:[put/jettison]")
-		    (pp data)
-		    (funcall st-state-dispatch
-			     (cons 'fetch/user nil))))))))
+   :callback (st-with-current-api-response
+	      (funcall st-state-dispatch (cons 'fetch/user nil)))))
      
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -490,12 +540,12 @@ GOOD: string"
 
 (defun st-fetch-ships-for-sale ()
   (interactive)
-  (st-api-call "game/ships"
-	       :params `((token . ,spacetraders-token))
-	       :callback (cl-function
-			  (lambda (&key data &key error-thrown &allow-other-keys)
-			    (setq st-ships-for-sale data)
-			    (message "[Fetch ships for sale]")))))
+  (st-api-call
+   "game/ships"
+   :params `((token . ,spacetraders-token))
+   :callback (st-with-current-api-response
+	      (setq st-ships-for-sale st-api-current-response)
+	      (message "ST:Retrieved ships for sale."))))
 
 (defun st-post-ship-purchase (loc-sym ship-type)
   (interactive
@@ -510,17 +560,10 @@ GOOD: string"
      :headers `((Content-Type . "application/json"))
      :data (json-encode `((location . ,loc-sym)
 			  (type . ,ship-type)))
-     :callback (cl-function
-		(lambda (&key data &key error-thrown &allow-other-keys)
-		  (if error-thrown
-		      (progn
-			(message "ST-ERR:[post/ship-purchase] %s" error-thrown)
-			(pp data))
-		    (progn
-		      (message "[Purchased ship]")
-		      (pp data)
-		      (funcall st-state-dispatch
-			       (cons 'fetch/user nil)))))))))
+     :callback (st-with-current-api-response
+		(message "ST:Purchased ship.")
+		(pp st-api-current-response)
+		(funcall st-state-dispatch (cons 'fetch/user nil))))))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -637,28 +680,34 @@ P2: (cons number numer)"
 		 (st-distance-between  (st-location-coords (st-get-location))
 				       (st-location-coords row)))))))
 
-(cl-defun st-dispatch-system (&key data &key error-thrown &allow-other-keys)
-  (if error-thrown
-      (progn
-	(message "ST:ERR[fetch/system] %s" error-thrown)
-	(pp data))
-    (funcall st-state-dispatch
-	     (st-action-retrieved/system data))))
-
 (defun st-fetch-system (loc)
   (interactive
    (let ((loc (or (st-get-ship-system)
 		  (read-string "Symbol? "))))
      (list loc)))
-  (st-api-call (format "game/systems/%s/locations" loc)
-	       :params `((token . ,spacetraders-token))
-	       :callback 'st-dispatch-system))
+  (st-api-call
+   (format "systems/%s/locations" loc)
+   :params `((token . ,spacetraders-token))
+   :callback (st-with-current-api-response
+	      (funcall st-state-dispatch
+		       (cons 'retrieved/system
+			     st-api-current-response)))))
 
 (defun st-deferred-fetch-system (loc)
   (st-deferred-api-call
    (format "game/systems/%s/locations" loc)
    :params `((token . ,spacetraders-token))))
 
+(defun st-fetch-location (loc)
+  (interactive
+   (let ((loc (or (st-get-ship-location)
+		  (read-string "Location symbol? "))))
+     (list loc)))
+  (st-api-call
+   (format "locations/%s" loc)
+   :params `((token . ,spacetraders-token))
+   :callback (st-with-current-api-response
+	      (pp st-api-current-response))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Flightplans ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -730,20 +779,16 @@ P2: (cons number numer)"
   (/ (assoc-default 'distance (st-get-flightplan))
      (assoc-default 'fuelConsumed (st-get-flightplan))))
 
-(cl-defun st-dispatch-flightplan (&key data &key error-thrown &allow-other-keys)
-  (if error-thrown
-      (progn
-	(message "ST:ERR[post/flightplan] %s" error-thrown)
-	(pp data))
-    (progn
-      (pp data)
-      (funcall st-state-dispatch
-	       (st-action-retrieved/flightplan data))
-      (message "ST:[post/flightplan] Departing %s for %s. ETA is %s seconds. Expected fuel efficiency is %s."
-	       (st-get-flightplan-departure)
-	       (st-get-flightplan-destination)
-	       (st-get-flightplan-time-remaining)
-	       (st-get-flightplan-fuel-efficiency)))))
+(defun st-dispatch-flightplan (data)
+  (progn
+    (pp data)
+    (funcall st-state-dispatch
+	     (st-action-retrieved/flightplan data))
+    (message "ST:[post/flightplan] Departing %s for %s. ETA is %s seconds. Expected fuel efficiency is %s."
+	     (st-get-flightplan-departure)
+	     (st-get-flightplan-destination)
+	     (st-get-flightplan-time-remaining)
+	     (st-get-flightplan-fuel-efficiency))))
 
 (defun st-post-flightplan (loc)
   "Create a flight plan within the current system."
@@ -757,7 +802,8 @@ P2: (cons number numer)"
    :params `((token . ,spacetraders-token))
    :data (json-encode `((shipId . ,st-current-ship)
 			(destination . ,loc)))
-   :callback 'st-dispatch-flightplan))
+   :callback (st-with-current-api-response
+	      (st-dispatch-flightplan st-api-current-response))))
 
 (defun st-fetch-flightplan (flightplan-id)
   "Get flightplan data."
@@ -770,14 +816,9 @@ P2: (cons number numer)"
 	   flightplan-id)
    :headers `((Content-Type . "application/json"))
    :params `((token . ,spacetraders-token))
-   :callback (cl-function
-	      (lambda (&key data &key error-thrown &allow-other-keys)
-		(if error-thrown
-		    (message "ST:ERR[fetch/flightplan] %s"
-			     (assoc-default 'message data))
-		  (progn
-		    (message "ST:[fetch/flightplan] Retrieved flightplan.")
-		    (pp d)))))))
+   :callback (st-with-current-api-response
+	      (message "ST:Retrieved flightplan.")
+	      (pp st-api-current-response))))
 
 (defun st-post-warp-jump (ship-id)
   (interactive
@@ -785,12 +826,14 @@ P2: (cons number numer)"
        (list st-current-ship)
      (let ((ship-id (st-read-options (st-options-user-ships))))
        (list ship-id))))
-  (st-api-call (format "users/%s/warp-jump" spacetraders-username)
-	       :method "post"
-	       :headers `((Content-Type . application/json))
-	       :params `((token . ,spacetraders-token))
-	       :data (json-encode `((shipId . ,ship-id)))
-	       :callback 'st-dispatch-flightplan))
+  (st-api-call
+   (format "users/%s/warp-jump" spacetraders-username)
+   :method "post"
+   :headers `((Content-Type . application/json))
+   :params `((token . ,spacetraders-token))
+   :data (json-encode `((shipId . ,ship-id)))
+   :callback (st-with-current-api-response
+	      (st-dispatch-flightplan st-api-current-response))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Marketplace functions ;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -834,14 +877,6 @@ P2: (cons number numer)"
 	      (apply-partially 'assoc 'symbol)
 	      (lambda (row) (cons 'location (st-get-ship-location))))))
 
-(cl-defun st-dispatch-marketplace (&key data &key error-thrown &allow-other-keys)
-  (if error-thrown
-      (progn
-	(message "ST:ERR[fetch/marketplace] %s" error-thrown)
-	(pp data))
-    (funcall st-state-dispatch
-	     (st-action-retrieved/marketplace data))))
-
 (defun st-fetch-marketplace (loc)
   (interactive
    (let ((loc (or (st-get-ship-location)
@@ -850,61 +885,55 @@ P2: (cons number numer)"
   (st-api-call
    (format "game/locations/%s/marketplace" loc)
    :params `((token . ,spacetraders-token))
-   :callback 'st-dispatch-marketplace))
+   :callback (st-with-current-api-response
+	      (funcall st-state-dispatch
+		       (cons 'retrieved/marketplace
+			     st-api-current-response)))))
 
 (defun st-deferred-fetch-marketplace (loc)
   (st-deferred-api-call
    (format "game/locations/%s/marketplace" loc)
    :params `((token . ,spacetraders-token))))
 
-(cl-defun st-dispatch-sell (&key data &key error-thrown &allow-other-keys)
-  (if error-thrown
-      (progn
-	(message "ST:ERR[post/sell] %s" error-thrown)
-	(pp data))
-    (funcall st-state-dispatch
-	     (cons 'fetch/user nil))))
-
 (defun st-post-sell (good quantity)
    (interactive
     (let* ((good (st-read-options (st-options-ship-cargo)))
 	   (max-available (st-query-ship-cargo-item-quantity good))
 	   (quantity (read-number (format "Quantity of %s (max %s)?  " good max-available))))
-      (when (> quantity max-available) (setq quantity max-available))
+      (when (> quantity max-available)
+	(setq quantity max-available))
       (list good quantity)))
-   (st-api-call (format "users/%s/sell-orders" spacetraders-username)
-	       :method "post"
-	       :headers `((Content-Type . "application/json"))
-	       :params `((token . ,spacetraders-token))
-	       :data (json-encode `((shipId . ,st-current-ship)
-				    (good . ,good)
-				    (quantity . ,quantity)))
-	       :callback 'st-dispatch-sell))
-
-(cl-defun st-dispatch-buy (&key data &key error-thrown &allow-other-keys)
-  (if error-thrown
-      (progn
-	(message "ST:ERR[post/buy] %s" error-thrown)
-	(pp data))
-    (funcall st-state-dispatch
-	     (cons 'fetch/user nil))))
+   (st-api-call
+    (format "users/%s/sell-orders" spacetraders-username)
+    :method "post"
+    :headers `((Content-Type . "application/json"))
+    :params `((token . ,spacetraders-token))
+    :data (json-encode `((shipId . ,st-current-ship)
+			 (good . ,good)
+			 (quantity . ,quantity)))
+    :callback (st-with-current-api-response
+	       (funcall st-state-dispatch
+			(cons 'fetch/user nil)))))
 
 (defun st-post-buy (good quantity)
   (interactive
    (let* ((good (st-read-options (st-options-marketplace-goods)))
 	  (space-left (st-get-ship-space-available))
 	  (quantity (read-number (format "Quantity of %s (%s cargo space remaining)? " good space-left))))
-     (when (> quantity space-left) (setq quantity space-left))
+     (when (> quantity space-left)
+       (setq quantity space-left))
      (list good quantity)))
-  (st-api-call (format "users/%s/purchase-orders" spacetraders-username)
-	       :method "post"
-	       :headers `((Content-Type . "application/json"))
-	       :params `((token . ,spacetraders-token))
-	       :data (json-encode `((shipId . ,st-current-ship)
-				    (good . ,good)
-				    (quantity . ,quantity)))
-	       :callback 'st-dispatch-buy))
-
+  (st-api-call
+   (format "users/%s/purchase-orders" spacetraders-username)
+   :method "post"
+   :headers `((Content-Type . "application/json"))
+   :params `((token . ,spacetraders-token))
+   :data (json-encode `((shipId . ,st-current-ship)
+			(good . ,good)
+			(quantity . ,quantity)))
+   :callback (st-with-current-api-response
+	      (funcall st-state-dispatch
+		       (cons 'fetch/user nil)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Loan functions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -922,41 +951,28 @@ P2: (cons number numer)"
 
 (defun st-fetch-loans ()
   (interactive)
-  (st-api-call "game/loans"
-	       :params `((token . ,spacetraders-token))
-	       :callback (st-api-callback
-			  (lambda (d)
-			    (setq st-loans d)
-			    (message "[Fetched loan data]")))))
+  (st-api-call
+   "game/loans"
+   :params `((token . ,spacetraders-token))
+   :callback (st-with-current-api-response
+	      (setq st-loans st-api-current-response)
+	      (pp data))))
 
 (defun st-post-loan (loan-type)
   (interactive
    (let ((loan-type (st-read-options (st-options-loans))))
      (list loan-type)))
-  (st-api-call (format "users/%s/loans" spacetraders-username)
-	       :method "post"
-	       :headers `((Content-Type ."application/json"))
-	       :params `((token . , spacetraders-token))
-	       :data (json-encode `((type . ,loan-type)))
-	       :callback (st-api-callback
-			  (lambda (d)
-			    (message "[Fetched loan]")
-			    (pp d)
-			    (funcall st-state-dispatch
-				     (cons 'fetch/user nil))))))
+  (st-api-call
+   (format "users/%s/loans" spacetraders-username)
+   :method "post"
+   :headers `((Content-Type ."application/json"))
+   :params `((token . , spacetraders-token))
+   :data (json-encode `((type . ,loan-type)))
+   :callback (st-with-current-api-response
+	      (pp data)
+	      (funcall st-state-dispatch
+		       (cons 'fetch/user nil)))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Misc functions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(defun st-get-all-systems ()
-  (interactive)
-  (st-api-call "game/systems"
-	       :params `((token . ,st-token))
-	       :callback (st-api-callback
-			  (lambda (d)
-			    (progn
-			      (putq-state systems d)
-			      (message "Retrieved systems data."))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Table Functions KEEP ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -992,11 +1008,11 @@ ex: '((a . 1) (b . (1 2 3)) (c . 3)) ->
 	  ass-list))
 
 (defun select-headers (ass-list)
-  (mapcar 'car (car ass-list)))
+  (mapcar #'car (car ass-list)))
 
 (defun select-rows (ass-list)
   (mapcar (lambda (pairs)
-	    (mapcar 'cdr pairs))
+	    (mapcar #'cdr pairs))
 	  ass-list))
 
 (defun pluck-from-ass (selectors pairs)
@@ -1050,18 +1066,29 @@ USE-ORG-MODE?: boolean"
       (buffer-substring-no-properties (point-min)
 				      (point-max)))))
 
-(defun st-get-user-ship-status ()
-  (ass-table (st-get-user-ships)
-	     (apply-partially 'assoc 'id)
-	     (apply-partially 'assoc 'location)
-	     (apply-partially 'assoc 'spaceAvailable)
-	     (apply-partially 'assoc 'type)
-	     (apply-partially 'assoc 'class)
-	     (apply-partially 'assoc 'maxCargo)
-	     (apply-partially 'assoc 'speed)
-	     (apply-partially 'assoc 'manufacturer)
-	     (apply-partially 'assoc 'plating)
-	     (apply-partially 'assoc 'weapons)))
+(defun st-get-user-ship-status (&optional use-links)
+  (let ((listing (if use-links
+		     (seq-map
+		      (lambda (pairs)
+			(seq-map
+			 (lambda (pair)
+			   (if (eq (car pair) 'id)
+			       (cons 'id (format "<<%s>>" (cdr pair)))
+			     pair))
+			 pairs))
+		      (st-get-user-ships))
+		   (st-get-user-ships))))
+    (ass-table listing
+	       (apply-partially 'assoc 'id)
+	       (apply-partially 'assoc 'location)
+	       (apply-partially 'assoc 'spaceAvailable)
+	       (apply-partially 'assoc 'type)
+	       (apply-partially 'assoc 'class)
+	       (apply-partially 'assoc 'maxCargo)
+	       (apply-partially 'assoc 'speed)
+	       (apply-partially 'assoc 'manufacturer)
+	       (apply-partially 'assoc 'plating)
+	       (apply-partially 'assoc 'weapons))))
 
 (defun st-get-user-loan-status ()
    (ass-table (st-get-user-loans)
@@ -1077,7 +1104,7 @@ USE-ORG-MODE?: boolean"
 	     (apply-partially 'assoc 'quantity)
 	     (apply-partially 'assoc 'totalVolume)))
 
-(defun st-get-user-status ()
+(defun st-get-user-status (&optional use-links)
   (list (cons 'credits (st-get-user-credits))
 	(cons 'debts (st-get-user-debts))
 	(cons 'balance (st-get-user-balance))
@@ -1142,16 +1169,17 @@ A-LIST: List-of-Assoc"
   (let ((local-user-state
 	 (apply-partially 'st-display-u-list
 			  (format "* Current status for %s" spacetraders-username)
-			  (st-get-user-status)))
+			  (st-get-user-status t)))
 	(local-ship-state
 	 (apply-partially 'st-display-table
 			  "* Ships"
-			  (st-get-user-ship-status)))
+			  (st-get-user-ship-status t)))
 	(local-loan-state
 	 (apply-partially 'st-display-table
 			  "* Loans"
 			  (st-get-user-loan-status)))
 	(local-cargo
+	 ;; Throws an error if no ship is selected?
 	 (apply-partially 'st-display-table
 			  (format "* Cargo for %s" st-current-ship)
 			  (st-status-ship-cargo))))
@@ -1216,3 +1244,22 @@ A-LIST: List-of-Any"
    (cons 'post/sell (list "CONSTRUCTION_MATERIAL" 'sell-all))
    (cons 'post/buy '("FUEL" refill-min-amount))
    (cons 'post/buy "")))
+
+(defun st-options-selectors ()
+  (with-current-buffer (get-buffer-create "space-traders.el")
+    (let* ((as-strings (seq-map
+			(lambda (sym)
+			  (symbol-name sym))
+			(apropos-internal "--cl-block-st-get")))
+	   (filtered (seq-filter
+		      (lambda (name)
+			(cl-search "st-get" name))
+		      as-strings))
+	   (formatted (seq-map
+		       (lambda (name)
+			 (let* ((cut-front (substring name (+ 1 (length "--cl-block-st-get"))))
+				(cut-back (substring cut-front 0 (- (length cut-front) 2))))
+			   cut-back))
+		       filtered)))
+      formatted)))
+
